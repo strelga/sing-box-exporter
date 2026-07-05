@@ -11,6 +11,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/net/proxy"
 )
 
 // ── Clash API response structures ───────────────────────────────────────
@@ -103,6 +104,26 @@ var (
 		Name: "sing_box_scrape_errors_total",
 		Help: "Total number of errors scraping sing-box Clash API",
 	}, []string{"endpoint"})
+
+	singBoxConnectionDuration = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "sing_box_connection_duration_seconds",
+		Help: "Duration of active connection in seconds",
+	}, []string{"id", "network", "source", "destination", "outbound"})
+
+	singBoxConnectionDurationAvg = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "sing_box_connection_duration_avg_seconds",
+		Help: "Average duration of active connections in seconds",
+	})
+
+	tunnelRTTMilliseconds = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "tunnel_rtt_milliseconds",
+		Help: "TCP round-trip time through the gost tunnel to hop 2 in milliseconds",
+	})
+
+	tunnelProbeErrors = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "tunnel_probe_errors_total",
+		Help: "Total number of tunnel RTT probe failures",
+	})
 )
 
 // ── Exporter ────────────────────────────────────────────────────────────
@@ -128,6 +149,29 @@ func (e *Exporter) scrape() {
 
 	e.scrapeConnections()
 	e.scrapeMemory()
+}
+
+// probeTunnelRTT measures TCP connection time through the gost SOCKS5 proxy to hop 2.
+func probeTunnelRTT(socks5Addr, targetAddr string) {
+	dialer, err := proxy.SOCKS5("tcp", socks5Addr, nil, proxy.Direct)
+	if err != nil {
+		log.Printf("ERROR: failed to create SOCKS5 dialer: %v", err)
+		tunnelProbeErrors.Inc()
+		return
+	}
+
+	start := time.Now()
+	conn, err := dialer.Dial("tcp", targetAddr)
+	if err != nil {
+		log.Printf("WARN: tunnel RTT probe failed to %s via %s: %v", targetAddr, socks5Addr, err)
+		tunnelProbeErrors.Inc()
+		return
+	}
+	conn.Close()
+
+	rtt := time.Since(start).Milliseconds()
+	tunnelRTTMilliseconds.Set(float64(rtt))
+	log.Printf("Tunnel RTT: %dms (via %s -> %s)", rtt, socks5Addr, targetAddr)
 }
 
 func (e *Exporter) scrapeConnections() {
@@ -159,6 +203,7 @@ func (e *Exporter) scrapeConnections() {
 	singBoxConnectionsByNetwork.Reset()
 	singBoxConnectionsByInbound.Reset()
 	singBoxConnectionsByOutbound.Reset()
+	singBoxConnectionDuration.Reset()
 
 	singBoxUploadTotal.Set(float64(data.UploadTotal))
 	singBoxDownloadTotal.Set(float64(data.DownloadTotal))
@@ -167,6 +212,7 @@ func (e *Exporter) scrapeConnections() {
 	networkCounts := make(map[string]float64)
 	inboundCounts := make(map[string]float64)
 	outboundCounts := make(map[string]float64)
+	var totalDuration float64
 
 	for _, conn := range data.Connections {
 		network := conn.Metadata.Network
@@ -197,6 +243,21 @@ func (e *Exporter) scrapeConnections() {
 
 		singBoxConnectionUpload.WithLabelValues(conn.ID, network, src, dst, outbound).Set(float64(conn.Upload))
 		singBoxConnectionDownload.WithLabelValues(conn.ID, network, src, dst, outbound).Set(float64(conn.Download))
+
+		// Calculate connection duration from start time
+		if conn.Start != "" {
+			if startTime, err := time.Parse(time.RFC3339, conn.Start); err == nil {
+				dur := time.Since(startTime).Seconds()
+				singBoxConnectionDuration.WithLabelValues(conn.ID, network, src, dst, outbound).Set(dur)
+				totalDuration += dur
+			}
+		}
+	}
+
+	if len(data.Connections) > 0 {
+		singBoxConnectionDurationAvg.Set(totalDuration / float64(len(data.Connections)))
+	} else {
+		singBoxConnectionDurationAvg.Set(0)
 	}
 
 	for net, count := range networkCounts {
@@ -262,9 +323,13 @@ func main() {
 		singBoxConnectionsByOutbound,
 		singBoxConnectionUpload,
 		singBoxConnectionDownload,
+		singBoxConnectionDuration,
+		singBoxConnectionDurationAvg,
 		singBoxMemoryInUse,
 		singBoxMemoryOSLimit,
 		singBoxScrapeErrors,
+		tunnelRTTMilliseconds,
+		tunnelProbeErrors,
 	)
 
 	exporter := NewExporter(singBoxURL)
@@ -272,12 +337,20 @@ func main() {
 	// Initial scrape
 	exporter.scrape()
 
+	// RTT probe config (set via env vars, no hardcoded addresses)
+	socks5Addr := os.Getenv("SOCKS5_ADDR")
+	rttTarget := os.Getenv("RTT_TARGET")
+	rttEnabled := socks5Addr != "" && rttTarget != ""
+
 	// Periodic scraping in background
 	go func() {
 		ticker := time.NewTicker(scrapeInterval)
 		defer ticker.Stop()
 		for range ticker.C {
 			exporter.scrape()
+			if rttEnabled {
+				probeTunnelRTT(socks5Addr, rttTarget)
+			}
 		}
 	}()
 
